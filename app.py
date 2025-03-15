@@ -1,40 +1,28 @@
 import os
+import time
 import requests
-from flask import Flask, render_template, request, jsonify, session
 from groq import Groq
-from dotenv import load_dotenv
+from PyPDF2 import PdfReader
 
-# Load environment variables
-load_dotenv()
+# API Keys
+GROQ_API_KEY = "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"
+SARVAM_API_KEY = "9e95e478-07bd-4d90-ad75-7cbefa3d8172"
 
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "default_secret_key")  # For session management
-
-# API Keys from environment variables
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-
-# Check if API keys are available
-if not GROQ_API_KEY:
-    print("Warning: GROQ_API_KEY is not set in environment variables")
 if not SARVAM_API_KEY:
-    print("Warning: SARVAM_API_KEY is not set in environment variables")
+    raise ValueError("Sarvam API key is missing!")
 
-# Groq client
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+# Initialize Groq client
+client = Groq(api_key=GROQ_API_KEY)
 
-# Sarvam API endpoint
+# Translation API details
 TRANSLATE_URL = "https://api.sarvam.ai/translate"
 TRANSLATE_HEADERS = {
     "api-subscription-key": SARVAM_API_KEY,
     "Content-Type": "application/json"
-} if SARVAM_API_KEY else {}
+}
 
 def translate_text(text, source_lang, target_lang):
     """Translates text using Sarvam AI"""
-    if not SARVAM_API_KEY:
-        return f"Translation failed: API key not configured. Original text: {text}"
-        
     payload = {
         "source_language_code": source_lang,
         "target_language_code": target_lang,
@@ -44,94 +32,77 @@ def translate_text(text, source_lang, target_lang):
         "enable_preprocessing": False,
         "input": text
     }
-    
-    try:
-        response = requests.post(TRANSLATE_URL, json=payload, headers=TRANSLATE_HEADERS)
-        response.raise_for_status()  # Raise exception for HTTP errors
+    response = requests.post(TRANSLATE_URL, json=payload, headers=TRANSLATE_HEADERS)
+    if response.status_code == 200:
         return response.json().get("translated_text", "Translation not available")
-    except requests.exceptions.RequestException as e:
-        print(f"Translation error: {str(e)}")
-        return f"Translation failed: {str(e)}. Original text: {text}"
+    return "Translation failed."
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def process_chunk(chunk_text, user_lang):
+    """Processes a text chunk with Groq AI and translates the response."""
+    messages = [
+        {"role": "user", "content": "Here is the document and the attached text:\n"},
+        {"role": "user", "content": "Display my name, you have all my details, and you are the loan advisor: " + chunk_text}
+    ]
+    completion = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=messages,
+        temperature=1,
+        max_completion_tokens=1024,
+        top_p=1,
+        stream=True,
+        stop=None,
+    )
+    response_text = "".join(chunk.choices[0].delta.content or "" for chunk in completion)
+    translated_response = translate_text(response_text, "en-IN", user_lang)
+    print(translated_response)
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    try:
-        data = request.json
-        user_message = data.get('message', '')
-        user_lang = data.get('language', 'en-IN')
+def process_pdf(file_path, user_lang):
+    """Reads a PDF file and processes it with Groq"""
+    reader = PdfReader(file_path)
+    for page_num in range(len(reader.pages)):
+        page_text = reader.pages[page_num].extract_text()
+        chunk_size = 1000
+        text_chunks = [page_text[i:i + chunk_size] for i in range(0, len(page_text), chunk_size)]
+        for chunk_text in text_chunks:
+            process_chunk(chunk_text, user_lang)
+
+def conversation(user_lang):
+    """Loan Advisor Chatbot Interaction"""
+    print("Welcome to the Loan Advisor Chatbot. Type 'quit' to exit.")
+    messages = [{"role": "system", "content": "You are a helpful loan advisor and should give short answers."}]
+    
+    print(translate_text("Good day Rahul Sharma. I'm your loan advisor, here to assist you in navigating the loan options and eligibility criteria at the State Bank of India. I have reviewed your information and would like to proceed with a discussion on your loan requirements.\n\nMay I confirm, Rahul, what type of loan are you looking to apply for? You have a savings account with a robust balance, which suggests a good basis for securing a loan with a competitive interest rate. Considering your financial documents, we can work on identifying loan options that suit your income profile and financial goals.", "en-IN", user_lang))
+    
+    while True:
+        question = input("You: ")
+        if question.lower() in ["quit", "exit", "stop"]:
+            print("Goodbye!")
+            break
         
-        # Initialize or get session messages
-        if 'messages' not in session:
-            session['messages'] = [{"role": "system", "content": "You are a helpful loan advisor and i want you to give short answers."}]
+        translated_question = translate_text(question, user_lang, "en-IN")
+        messages.append({"role": "user", "content": translated_question})
         
-        # Check if API keys are configured
-        if not GROQ_API_KEY or not SARVAM_API_KEY:
-            return jsonify({
-                'original_response': "API keys not configured. Please check server setup.",
-                'translated_response': "API keys not configured. Please check server setup."
-            }), 500
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=1,
+            max_completion_tokens=1024,
+            top_p=1
+        )
         
-        # Skip translation if language is English
-        if user_lang == "en-IN":
-            translated_question = user_message
+        if completion.choices and completion.choices[0].message:
+            answer = completion.choices[0].message.content
         else:
-            # Translate user message to English
-            translated_question = translate_text(user_message, user_lang, "en-IN")
+            answer = "I didn't understand that question."
         
-        # Add to message history
-        session['messages'].append({"role": "user", "content": translated_question})
+        translated_answer = translate_text(answer, "en-IN", user_lang)
+        print("Loan Advisor:", translated_answer)
         
-        # Get response from Groq
-        try:
-            completion = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=session['messages'],
-                temperature=1,
-                max_completion_tokens=1024,
-                top_p=1
-            )
-            
-            if completion.choices and completion.choices[0].message:
-                answer = completion.choices[0].message.content
-            else:
-                answer = "I didn't understand that question."
-        except Exception as e:
-            print(f"Groq API error: {str(e)}")
-            answer = f"Error with LLM service: {str(e)}"
-        
-        # Skip translation if language is English
-        if user_lang == "en-IN":
-            translated_answer = answer
-        else:
-            # Translate answer back to user language
-            translated_answer = translate_text(answer, "en-IN", user_lang)
-        
-        # Add to message history
-        session['messages'].append({"role": "assistant", "content": answer})
-        session.modified = True
-        
-        return jsonify({
-            'original_response': answer,
-            'translated_response': translated_answer
-        })
-    except Exception as e:
-        print(f"General error in /chat: {str(e)}")
-        return jsonify({
-            'original_response': f"Server error: {str(e)}",
-            'translated_response': f"Server error: {str(e)}"
-        }), 500
+        messages.append({"role": "assistant", "content": answer})
+        time.sleep(0.5)
 
-@app.route('/reset', methods=['POST'])
-def reset_conversation():
-    if 'messages' in session:
-        session.pop('messages')
-    return jsonify({'status': 'success'})
-
-if __name__ == '__main__':
-    # Use PORT environment variable for hosting platforms
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=(os.environ.get("FLASK_ENV") == "development"))
+if __name__ == "__main__":
+    user_lang = input("Enter your language code (e.g., en-IN, hi-IN, kn-IN): ")
+    file_path = "loan.pdf"  # Update with the correct PDF path
+    process_pdf(file_path, user_lang)
+    conversation(user_lang)
